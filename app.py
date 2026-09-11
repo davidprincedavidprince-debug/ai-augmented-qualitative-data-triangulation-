@@ -32,7 +32,7 @@ st.caption(
 
 with st.sidebar:
     st.header("Session")
-    if st.button("Reset all data", use_container_width=True):
+    if st.button("Reset all data", width="stretch"):
         db.reset_db()
         st.success("Cleared.")
         st.rerun()
@@ -219,6 +219,19 @@ with tabs[3]:
             target_embedding, indicator["target_description"], qual_entries
         )
 
+        # Auto-run entailment for every entry that isn't already cached — no
+        # button needed. Cached results persist for the session, so this only
+        # actually calls the API once per entry, not on every rerun.
+        uncached = [e for e in scored if f"entail_result_{e['id']}" not in st.session_state]
+        if uncached:
+            progress = st.progress(0.0, text=f"Checking {len(uncached)} entries against the target...")
+            for i, entry in enumerate(uncached):
+                st.session_state[f"entail_result_{entry['id']}"] = agents.check_entailment(
+                    indicator["target_description"], entry["text"]
+                )
+                progress.progress((i + 1) / len(uncached))
+            progress.empty()
+
         st.divider()
         st.write(f"Target: *{indicator['target_description']}*")
 
@@ -241,7 +254,7 @@ with tabs[3]:
         ])
         compare_df["abs_gap"] = compare_df["gap"].abs()
         compare_df = compare_df.sort_values("abs_gap", ascending=False).drop(columns="abs_gap")
-        st.dataframe(compare_df, use_container_width=True)
+        st.dataframe(compare_df, width="stretch")
 
         biggest = max(scored, key=lambda e: abs(e["gap"]))
         if abs(biggest["gap"]) > 0.15:
@@ -251,10 +264,9 @@ with tabs[3]:
                     f"lexical score {biggest['lexical_score']:.3f} for: \"{biggest['text'][:100]}\" — "
                     f"the embedding recognises this as related in meaning despite sharing few or no "
                     f"exact words with the target. A pure keyword-matching approach would likely have "
-                    f"missed this entry entirely. If the semantic score also looks suspiciously high "
-                    f"despite the entry describing an exclusion or restriction, use the entailment "
-                    f"check below on this entry — cosine similarity alone can be fooled by shared "
-                    f"topic words even when the actual claim is a contradiction."
+                    f"missed this entry entirely. Note the red/green flags below are driven by the "
+                    f"LLM entailment check, not this raw score — see the entailment verdict for the "
+                    f"actual reasoning."
                 )
             else:
                 st.warning(
@@ -266,60 +278,44 @@ with tabs[3]:
                 )
 
         st.divider()
-        st.subheader("Similarity threshold")
+        st.subheader("Divergence result (LLM entailment — primary signal)")
         st.caption(
-            "Anything below this threshold is treated as divergent (🔴) and worth a closer "
-            "look; anything at or above it is treated as aligned (🟢). Move it and watch which "
-            "entries move between groups — there's no single 'correct' setting, that's the point. "
-            "The threshold is applied to the semantic score, not the lexical score."
-        )
-        threshold = st.slider(
-            "Divergence threshold (cosine similarity)",
-            min_value=0.0, max_value=1.0, value=0.70, step=0.01,
-            key=f"threshold_{indicator['id']}",
+            "Every entry above was already checked automatically. Red/green here is decided "
+            "by the entailment verdict — 'contradicts' is red and 'supports' is green, "
+            "regardless of the raw cosine similarity score. Cosine similarity is used only as "
+            "a fallback for entries the LLM marks 'unrelated' (no strong signal either way)."
         )
 
-        divergent = [e for e in scored if e["semantic_score"] < threshold]
-        aligned = [e for e in scored if e["semantic_score"] >= threshold]
-        c1, c2 = st.columns(2)
-        c1.metric("Flagged as divergent (semantic only)", len(divergent))
-        c2.metric("Treated as aligned (semantic only)", len(aligned))
-
-        # Small distribution view so a threshold change is visible, not just counted
-        score_df = pd.DataFrame({"semantic_score": [e["semantic_score"] for e in scored]})
-        st.bar_chart(score_df["semantic_score"].sort_values(ascending=True).reset_index(drop=True))
-
-        st.divider()
-        st.subheader("Combined analysis (semantic + entailment)")
-        st.caption(
-            "Runs the entailment check on every entry below at once, then combines it with "
-            "the semantic score — entailment overrides the raw threshold when it detects clear "
-            "support or contradiction. Already-checked entries are skipped, so this is cheap to "
-            "re-run after adding new entries."
-        )
-        if st.button("Run combined analysis for all entries below"):
-            progress = st.progress(0.0)
-            for i, entry in enumerate(scored):
-                cache_key = f"entail_result_{entry['id']}"
-                if cache_key not in st.session_state:
-                    st.session_state[cache_key] = agents.check_entailment(
-                        indicator["target_description"], entry["text"]
-                    )
-                progress.progress((i + 1) / len(scored))
-            st.rerun()
-
-        combined_divergent = 0
-        combined_aligned = 0
+        llm_divergent = 0
+        llm_aligned = 0
         for entry in scored:
             cached = st.session_state.get(f"entail_result_{entry['id']}")
-            verdict = agents.combined_verdict(entry["semantic_score"], threshold, cached)
+            verdict = agents.combined_verdict(entry["semantic_score"], 0.70, cached)
             if verdict == "divergent":
-                combined_divergent += 1
+                llm_divergent += 1
             else:
-                combined_aligned += 1
-        c3, c4 = st.columns(2)
-        c3.metric("Flagged as divergent (combined)", combined_divergent)
-        c4.metric("Treated as aligned (combined)", combined_aligned)
+                llm_aligned += 1
+        c1, c2 = st.columns(2)
+        c1.metric("🔴 Flagged as divergent", llm_divergent)
+        c2.metric("🟢 Treated as aligned", llm_aligned)
+
+        with st.expander("Reference only: raw cosine similarity threshold (not used for the flags above)"):
+            st.caption(
+                "Kept for comparison purposes — this is what a cosine-similarity-only system "
+                "would have flagged, before the entailment check corrects it."
+            )
+            threshold = st.slider(
+                "Cosine similarity threshold (reference only)",
+                min_value=0.0, max_value=1.0, value=0.70, step=0.01,
+                key=f"threshold_{indicator['id']}",
+            )
+            divergent = [e for e in scored if e["semantic_score"] < threshold]
+            aligned = [e for e in scored if e["semantic_score"] >= threshold]
+            c3, c4 = st.columns(2)
+            c3.metric("Flagged as divergent (cosine only)", len(divergent))
+            c4.metric("Treated as aligned (cosine only)", len(aligned))
+            score_df = pd.DataFrame({"semantic_score": [e["semantic_score"] for e in scored]})
+            st.bar_chart(score_df["semantic_score"].sort_values(ascending=True).reset_index(drop=True))
 
         st.divider()
 
@@ -327,40 +323,31 @@ with tabs[3]:
             existing_review = db.get_review(indicator["id"], entry["id"])
             score = entry["semantic_score"]
             cached_entailment = st.session_state.get(f"entail_result_{entry['id']}")
-            combined = agents.combined_verdict(score, threshold, cached_entailment)
-
-            if cached_entailment:
-                flag = (
-                    "🔴 divergent (combined)" if combined == "divergent"
-                    else "🟢 aligned (combined)"
-                )
-            else:
-                flag = "🔴 below threshold — divergent (semantic only, not yet checked)" if score < threshold \
-                    else "🟢 at/above threshold — aligned (semantic only, not yet checked)"
+            verdict = agents.combined_verdict(score, threshold, cached_entailment)
+            flag = "🔴 divergent" if verdict == "divergent" else "🟢 aligned"
 
             with st.expander(f"{flag}  (semantic: {score:.3f}, lexical: {entry['lexical_score']:.3f}) — {entry['text'][:60]}..."):
                 st.write(entry["text"])
-                st.caption(f"Similarity to target: {score:.3f}  |  Source: {entry['source']}")
+                st.caption(f"Cosine similarity to target: {score:.3f} (reference only)  |  Source: {entry['source']}")
                 if existing_review:
                     st.info(f"Previously reviewed: {existing_review['status']} — {existing_review['human_note'] or ''}")
 
-                if st.button("Check for negation/contradiction (LLM)", key=f"entail_{entry['id']}"):
-                    with st.spinner("Checking..."):
+                if cached_entailment:
+                    verdict_icon = {"supports": "✅", "contradicts": "⚠️", "unrelated": "⬜"}.get(
+                        cached_entailment["verdict"], "❓"
+                    )
+                    st.write(f"{verdict_icon} **{cached_entailment['verdict']}** — {cached_entailment['reasoning']}")
+                    if cached_entailment["verdict"] == "contradicts" and score >= threshold:
+                        st.caption(
+                            "Cosine similarity alone would have missed this — it scored above the "
+                            "reference threshold. The entailment check caught it instead."
+                        )
+
+                if st.button("Recheck with LLM", key=f"entail_{entry['id']}"):
+                    with st.spinner("Rechecking..."):
                         result = agents.check_entailment(indicator["target_description"], entry["text"])
                     st.session_state[f"entail_result_{entry['id']}"] = result
-
-                entail_result = st.session_state.get(f"entail_result_{entry['id']}")
-                if entail_result:
-                    verdict_icon = {"supports": "✅", "contradicts": "⚠️", "unrelated": "⬜"}.get(
-                        entail_result["verdict"], "❓"
-                    )
-                    st.write(f"{verdict_icon} **{entail_result['verdict']}** — {entail_result['reasoning']}")
-                    if entail_result["verdict"] == "contradicts" and score >= threshold:
-                        st.error(
-                            "Note: cosine similarity treats this as aligned (above threshold), but the "
-                            "entailment check flags a contradiction — this is the negation-blindness gap "
-                            "in action. Worth treating as divergent regardless of the raw similarity score."
-                        )
+                    st.rerun()
 
                 note = st.text_input("Reviewer note (optional)", key=f"note_{entry['id']}")
                 c1, c2, c3 = st.columns(3)
